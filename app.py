@@ -10,24 +10,25 @@ app = Flask(__name__, static_folder='static')
 # Lấy thư mục gốc chứa file app.py hiện tại
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Ghép với tên file (Sửa lại thành 'Decuong.docx' cho đúng chữ c thường như trong ảnh)
-DOCX_FILE = os.path.join(BASE_DIR, 'Decuong.docx')
+# Ghép với tên file (Dùng DECUONG.docx viết hoa cho khớp với file hệ thống)
+DOCX_FILE = os.path.join(BASE_DIR, 'DECUONG.docx')
 
 # Tạo thư mục lưu ảnh (Cũng dùng BASE_DIR cho an toàn)
 os.makedirs(os.path.join(BASE_DIR, 'static', 'images'), exist_ok=True)
 
 def is_correct_format(run):
     """
-    Hàm kiểm tra xem một đoạn text (run) có được highlight màu vàng hay không.
-    Sử dụng try-except để tránh lỗi khi highlight trong Word được set là 'None'.
+    Hàm kiểm tra xem một đoạn text (run) có được tô màu đỏ hoặc gạch chân hay không.
     """
+    # Kiểm tra gạch chân
+    if run.font.underline:
+        return True
+    
+    # Kiểm tra màu đỏ
     try:
-        # Kiểm tra nếu thuộc tính highlight_color là màu vàng
-        if run.font.highlight_color == WD_COLOR_INDEX.YELLOW:
+        if run.font.color and run.font.color.rgb == docx.shared.RGBColor(255, 0, 0):
             return True
-    except ValueError:
-        # Bắt lỗi "ValueError: WD_COLOR_INDEX has no XML mapping for 'none'"
-        # Bỏ qua và ngầm hiểu là không có highlight màu vàng
+    except:
         pass
         
     return False
@@ -66,6 +67,9 @@ def parse_docx(file_path):
         if "PHẦN 2" in text_stripped.upper() or "ĐÚNG SAI" in text_stripped.upper() or "PHẦN II" in text_stripped.upper():
             part = 2
             continue
+        if "PHẦN 3" in text_stripped.upper() or "TRẢ LỜI NGẮN" in text_stripped.upper() or "PHẦN III" in text_stripped.upper():
+            part = 3
+            continue
 
         # Bắt đầu một câu hỏi mới
         is_question = bool(re.match(r'^câu\s*\d+', text_stripped.lower()))
@@ -73,12 +77,19 @@ def parse_docx(file_path):
             if current_q:
                 questions.append(current_q)
             current_q = {
-                "question_text": "",
-                "type": "mc" if part == 1 else "tf",
+                "question_text": text_stripped + img_html,
+                "type": "mc" if part != 2 else "tf",
                 "options": []
             }
+            continue
 
         if current_q:
+            # Xử lý Part 3 - Trả lời ngắn (Bắt đầu bằng @)
+            if part == 3 and text_stripped.startswith("@"):
+                current_q["type"] = "short"
+                current_q["answer"] = text_stripped.replace("@", "").strip()
+                continue
+
             # Lấy định dạng màu sắc của từng ký tự để bóc tách đáp án dính chùm
             char_formats = []
             for run in para.runs:
@@ -97,19 +108,20 @@ def parse_docx(file_path):
                 # Trường hợp Word tự đánh số list (A, B, C bị ẩn đi)
                 idx = len(current_q["options"])
                 prefix = f"<b>{chr(65+idx)}.</b> " if current_q['type'] == 'mc' else f"<b>{chr(97+idx)})</b> "
+                
+                # Đối với Part 2, kiểm tra xem có chữ "Đúng" hoặc "Sai" trong text không
+                is_correct = any(char_formats)
+                if current_q['type'] == 'tf':
+                    if " - Đúng" in text_stripped: is_correct = True
+                    elif " - Sai" in text_stripped: is_correct = False
+                
                 current_q["options"].append({
                     "text": prefix + text_stripped + img_html,
-                    "is_correct": any(char_formats)
+                    "is_correct": is_correct
                 })
             elif matches:
                 # Có các chữ A. B. C. D. thủ công
                 opt_starts = [m.start(1) for m in matches]
-                
-                # Nếu đằng trước chữ A. có text, thì text đó thuộc về câu hỏi
-                if opt_starts[0] > 0:
-                    prefix_text = text_raw[0:opt_starts[0]].strip()
-                    if prefix_text:
-                        current_q["question_text"] += ("<br>" + prefix_text) if current_q["question_text"] else prefix_text
                 
                 # Tách từng đoạn đáp án ra
                 for i in range(len(opt_starts)):
@@ -118,6 +130,12 @@ def parse_docx(file_path):
                     
                     opt_text = text_raw[start_idx:end_idx].strip()
                     opt_is_correct = any(char_formats[start_idx:end_idx])
+                    
+                    # Đối với Part 2, kiểm tra xem có chữ "Đúng" hoặc "Sai" không
+                    if part == 2:
+                        if " - Đúng" in opt_text: opt_is_correct = True
+                        elif " - Sai" in opt_text: opt_is_correct = False
+
                     opt_text_styled = re.sub(r'^([A-Da-d][.\)])', r'<b>\1</b>', opt_text)
                     final_img = img_html if i == len(opt_starts) - 1 else ""
                     
@@ -127,8 +145,7 @@ def parse_docx(file_path):
                     })
             else:
                 # Không phải đáp án -> Nối tiếp nội dung vào câu hỏi
-                if not current_q["options"]:
-                    current_q["question_text"] += ("<br>" + text_stripped + img_html) if current_q["question_text"] else (text_stripped + img_html)
+                current_q["question_text"] += ("<br>" + text_stripped + img_html)
     
     if current_q:
         questions.append(current_q)
@@ -289,6 +306,12 @@ HTML_TEMPLATE = """
                         </div>
                     `;
                 });
+            } else if (q.type === 'short') {
+                html += `
+                    <div class="mt-3">
+                        <input type="text" class="form-control form-control-lg border-2 shadow-sm rounded-3" id="short-${qIndex}" placeholder="Nhập đáp án của bạn...">
+                    </div>
+                `;
             }
             
             html += `<div id="feedback-${qIndex}" class="feedback-text shadow-sm"></div></div>`;
@@ -380,6 +403,21 @@ HTML_TEMPLATE = """
                 } else {
                     qCard.classList.add("graded-wrong");
                     feedbackBox.innerHTML = `<i class="bi bi-x-circle-fill"></i> Có ý bạn chọn sai (hoặc chưa chọn). Các nút đang sáng màu (Xanh/Đỏ) chính là đáp án chuẩn!`;
+                    feedbackBox.className = "feedback-text text-danger bg-white border border-danger mt-3";
+                }
+            } else if (q.type === 'short') {
+                let input = document.getElementById(`short-${qIndex}`);
+                let userAns = input.value.trim().toLowerCase();
+                let correctAns = q.answer.trim().toLowerCase();
+                input.disabled = true;
+                
+                if (userAns === correctAns) {
+                    qCard.classList.add("graded-correct");
+                    feedbackBox.innerHTML = `<i class="bi bi-stars"></i> Chính xác: <b>${q.answer}</b>`;
+                    feedbackBox.className = "feedback-text text-success bg-white border border-success mt-3";
+                } else {
+                    qCard.classList.add("graded-wrong");
+                    feedbackBox.innerHTML = `<i class="bi bi-x-circle-fill"></i> Sai rồi! Đáp án đúng là: <b>${q.answer}</b>`;
                     feedbackBox.className = "feedback-text text-danger bg-white border border-danger mt-3";
                 }
             }
